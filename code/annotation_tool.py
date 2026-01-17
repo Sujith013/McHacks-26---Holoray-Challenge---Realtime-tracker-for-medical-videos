@@ -5,43 +5,170 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-
-
-# Lucas-Kanade parameters tuned for medical video motion.
-LK_PARAMS: Dict[str, object] = dict(
-    winSize=(21, 21),
-    maxLevel=3,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
-)
 
 
 @dataclass
 class TrackerContext:
     """State container for per-annotation tracking."""
 
-    prev_points: Optional[np.ndarray] = None
+    template: Optional[np.ndarray] = None
+    template_size: Tuple[int, int] = (0, 0)
+    last_bbox: Optional[Tuple[float, float, float, float]] = None
+    track_id: Optional[int] = None
     status: str = "initializing"
     lost_frames: int = 0
     total_offset: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
-    reinit_frame: int = -1
+    last_score: float = 0.0
+
+
+@dataclass
+class TrackState:
+    """Internal state for a ByteTrack-managed track."""
+
+    track_id: int
+    annotation_id: int
+    bbox: Tuple[float, float, float, float]
+    score: float
+    hits: int = 1
+    time_since_update: int = 0
+    state: str = "tracked"
+
+
+def _iou(b1: Tuple[float, float, float, float], b2: Tuple[float, float, float, float]) -> float:
+    """Compute IoU between two (x, y, w, h) boxes."""
+
+    x1, y1, w1, h1 = b1
+    x2, y2, w2, h2 = b2
+
+    ax1, ay1 = x1, y1
+    ax2, ay2 = x1 + w1, y1 + h1
+    bx1, by1 = x2, y2
+    bx2, by2 = x2 + w2, y2 + h2
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+
+    inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    area_a = w1 * h1
+    area_b = w2 * h2
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+class ByteTracker:
+    """Lightweight ByteTrack-inspired multi-object tracker.
+
+    Tracks detections across frames using IoU matching and a simple buffer to
+    retain lost tracks for a short time window.
+    """
+
+    def __init__(self, match_thresh: float = 0.4, track_buffer: int = 30) -> None:
+        self.match_thresh = match_thresh
+        self.track_buffer = track_buffer
+        self.tracks: List[TrackState] = []
+        self.next_id: int = 1
+
+    def update(
+        self,
+        detections: List[Tuple[int, Tuple[float, float, float, float], float]]
+    ) -> Dict[int, TrackState]:
+        """Update tracker with current detections.
+
+        Args:
+            detections: list of (annotation_id, bbox(x,y,w,h), score)
+
+        Returns:
+            Mapping from annotation_id to the latest TrackState.
+        """
+
+        # Age existing tracks.
+        for track in self.tracks:
+            track.time_since_update += 1
+            if track.time_since_update > 0 and track.state == "tracked":
+                track.state = "lost"
+
+        unmatched_tracks = set(range(len(self.tracks)))
+        unmatched_dets = set(range(len(detections)))
+        matches: List[Tuple[int, int]] = []
+
+        # Greedy match detections to tracks by IoU.
+        for det_idx in sorted(unmatched_dets, key=lambda idx: detections[idx][2], reverse=True):
+            ann_id, det_bbox, _ = detections[det_idx]
+            best_idx = -1
+            best_iou = 0.0
+            for track_idx in list(unmatched_tracks):
+                track = self.tracks[track_idx]
+                if track.annotation_id != ann_id:
+                    continue
+                iou_val = _iou(track.bbox, det_bbox)
+                if iou_val > best_iou:
+                    best_iou = iou_val
+                    best_idx = track_idx
+            if best_idx >= 0 and best_iou >= self.match_thresh:
+                matches.append((best_idx, det_idx))
+                unmatched_tracks.discard(best_idx)
+                unmatched_dets.discard(det_idx)
+
+        # Update matched tracks.
+        for track_idx, det_idx in matches:
+            track = self.tracks[track_idx]
+            ann_id, det_bbox, det_score = detections[det_idx]
+            track.bbox = det_bbox
+            track.score = det_score
+            track.hits += 1
+            track.time_since_update = 0
+            track.state = "tracked"
+
+        # Handle unmatched detections (spawn new tracks).
+        for det_idx in list(unmatched_dets):
+            ann_id, det_bbox, det_score = detections[det_idx]
+            new_track = TrackState(
+                track_id=self.next_id,
+                annotation_id=ann_id,
+                bbox=det_bbox,
+                score=det_score,
+                hits=1,
+                time_since_update=0,
+                state="tracked"
+            )
+            self.tracks.append(new_track)
+            self.next_id += 1
+
+        # Handle unmatched tracks.
+        for track_idx in list(unmatched_tracks):
+            track = self.tracks[track_idx]
+            if track.time_since_update > self.track_buffer:
+                track.state = "removed"
+
+        # Filter out removed tracks.
+        self.tracks = [track for track in self.tracks if track.state != "removed"]
+
+        return {track.annotation_id: track for track in self.tracks}
 
 
 class MedicalAnnotationTool:
     """Interactive annotation + motion tracking tool built from scratch for HoloXR."""
 
-    def __init__(self, dataset_root: str = "/Users/santhosh/Desktop/hackathon/holoray/Dataset") -> None:
-        self.dataset_root = dataset_root
+    def __init__(self, dataset_root: Optional[str] = None) -> None:
+        base_dir = Path(__file__).resolve().parent
+        self.project_root = base_dir
+        self.dataset_root = Path(dataset_root).expanduser() if dataset_root else base_dir / "Dataset"
         self.video_path: Optional[str] = None
         self.cap: Optional[cv2.VideoCapture] = None
         self.window_name = "HoloXR Annotation Tracker"
 
         self.current_frame: Optional[np.ndarray] = None
-        self.current_gray: Optional[np.ndarray] = None
-        self.prev_gray: Optional[np.ndarray] = None
         self.frame_number: int = 0
         self.total_frames: int = 0
         self.fps: float = 0.0
@@ -54,11 +181,12 @@ class MedicalAnnotationTool:
         self.annotations: List[Dict[str, object]] = []
         self.current_draft: List[List[int]] = []
         self.next_annotation_id: int = 1
+        self.drawing: bool = False
 
-        self.max_features: int = 120
-        self.min_feature_threshold: int = 6
-        self.forward_backward_tol: float = 1.5
         self.max_lost_frames: int = 20
+        self.template_match_threshold: float = 0.6
+        self.search_scale: float = 2.0
+        self.byte_tracker = ByteTracker(match_thresh=0.3, track_buffer=self.max_lost_frames)
 
     # ------------------------------------------------------------------
     # Video lifecycle
@@ -70,12 +198,17 @@ class MedicalAnnotationTool:
         print("HoloXR :: Video Selection")
         print("=" * 72)
 
+        if not self.dataset_root.exists():
+            print(f"Dataset directory not found: {self.dataset_root}")
+            return False
+
+        dataset_root_str = str(self.dataset_root)
         video_files: List[tuple[str, str]] = []
-        for root, _, files in os.walk(self.dataset_root):
+        for root, _, files in os.walk(dataset_root_str):
             for file in files:
                 if file.lower().endswith((".mp4", ".avi", ".mov")):
                     full_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(full_path, self.dataset_root)
+                    rel_path = os.path.relpath(full_path, dataset_root_str)
                     video_files.append((rel_path, full_path))
 
         if not video_files:
@@ -131,16 +264,22 @@ class MedicalAnnotationTool:
     # ------------------------------------------------------------------
     # Annotation creation
     # ------------------------------------------------------------------
-    def mouse_callback(self, event: int, x: int, y: int, _flags: int, _params: object) -> None:
+    def mouse_callback(self, event: int, x: int, y: int, flags: int, _params: object) -> None:
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.current_draft.append([x, y])
-            if len(self.current_draft) == 2:
-                self.complete_annotation(rectangle_mode=True)
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            if len(self.current_draft) >= 3:
+            self.current_draft = [[x, y]]
+            self.drawing = True
+        elif event == cv2.EVENT_MOUSEMOVE and self.drawing and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if not self.current_draft or (abs(self.current_draft[-1][0] - x) + abs(self.current_draft[-1][1] - y)) > 1:
+                self.current_draft.append([x, y])
+        elif event == cv2.EVENT_LBUTTONUP and self.drawing:
+            self.drawing = False
+            if len(self.current_draft) >= 2:
                 self.complete_annotation(rectangle_mode=False)
             else:
-                print("Need at least three points for polygon.")
+                self.current_draft.clear()
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self.current_draft.clear()
+            self.drawing = False
     
     def complete_annotation(self, rectangle_mode: bool) -> None:
         if len(self.current_draft) < 2:
@@ -158,127 +297,175 @@ class MedicalAnnotationTool:
             "start_frame": self.frame_number,
             "timestamp": float(self.frame_number) / max(self.fps, 1.0),
             "metadata": meta,
-            "tracker": TrackerContext(reinit_frame=self.frame_number)
+            "tracker": TrackerContext()
         }
 
         self.annotations.append(annotation)
         self.next_annotation_id += 1
         print(f"\n✓ Annotation #{annotation['id']} created with {polygon.shape[0]} vertices")
 
-        if self.current_gray is not None:
-            self._initialize_tracker(annotation, self.current_gray)
+        if self.current_frame is not None:
+            self._initialize_tracker(annotation, self.current_frame)
+        else:
+            annotation["tracker"].status = "ready"
 
         self.current_draft.clear()
     
     # ------------------------------------------------------------------
     # Tracking logic
     # ------------------------------------------------------------------
-    def _initialize_tracker(self, annotation: Dict[str, object], gray: np.ndarray) -> None:
-        mask = np.zeros_like(gray)
-        cv2.fillPoly(mask, [annotation["polygon"].astype(np.int32)], 255)
-
-        features = cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=self.max_features,
-            qualityLevel=0.01,
-            minDistance=5,
-            mask=mask
-        )
-
+    def _initialize_tracker(self, annotation: Dict[str, object], frame: np.ndarray) -> None:
         ctx: TrackerContext = annotation["tracker"]
-        if features is not None and len(features) >= self.min_feature_threshold:
-            ctx.prev_points = features.astype(np.float32)
-            ctx.status = "tracking"
-            ctx.lost_frames = 0
-            ctx.total_offset = np.zeros(2, dtype=np.float32)
-        else:
-            ctx.prev_points = None
-            ctx.status = "insufficient"
-            ctx.lost_frames += 1
 
-    def track_annotations(self, prev_gray: np.ndarray, gray: np.ndarray) -> None:
+        if frame is None or frame.size == 0:
+            ctx.status = "unavailable"
+            return
+
+        bbox = self._bbox_from_polygon(annotation["polygon"])
+        template = self._extract_template(frame, bbox)
+
+        if template is None:
+            ctx.template = None
+            ctx.template_size = (0, 0)
+            ctx.last_bbox = None
+            ctx.status = "insufficient"
+            return
+
+        ctx.template = template
+        ctx.template_size = (template.shape[1], template.shape[0])
+        ctx.last_bbox = bbox
+        ctx.status = "ready"
+        ctx.lost_frames = 0
+        ctx.last_score = 1.0
+        ctx.total_offset = np.zeros(2, dtype=np.float32)
+
+    def track_annotations(self, frame: np.ndarray) -> None:
         if not self.tracking_enabled:
             for ann in self.annotations:
                 ann["tracker"].status = "paused"
             return
 
+        detections = self._generate_detections(frame)
+        track_map = self.byte_tracker.update(detections)
+
         for annotation in self.annotations:
             ctx: TrackerContext = annotation["tracker"]
+            track_state = track_map.get(annotation["id"])
 
-            if ctx.prev_points is None:
-                if (self.frame_number - ctx.reinit_frame) >= 3:
-                    ctx.reinit_frame = self.frame_number
-                    self._initialize_tracker(annotation, prev_gray)
-                continue
-
-            next_points, status, _ = cv2.calcOpticalFlowPyrLK(
-                prev_gray,
-                gray,
-                ctx.prev_points,
-                None,
-                **LK_PARAMS
-            )
-
-            if next_points is None:
-                ctx.prev_points = None
-                ctx.status = "reinit"
+            if track_state and track_state.state == "tracked":
+                ctx.track_id = track_state.track_id
+                ctx.last_bbox = track_state.bbox
+                ctx.last_score = track_state.score
+                ctx.status = "tracking"
+                ctx.lost_frames = 0
+                self._apply_bbox_update(annotation, track_state.bbox)
+            else:
                 ctx.lost_frames += 1
+                if ctx.lost_frames > self.max_lost_frames:
+                    ctx.status = "lost"
+                else:
+                    ctx.status = "reinit"
+
+    def _generate_detections(self, frame: np.ndarray) -> List[Tuple[int, Tuple[float, float, float, float], float]]:
+        detections: List[Tuple[int, Tuple[float, float, float, float], float]] = []
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        for annotation in self.annotations:
+            ctx: TrackerContext = annotation["tracker"]
+            if ctx.template is None or ctx.template_size == (0, 0):
                 continue
 
-            back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(
-                gray,
-                prev_gray,
-                next_points,
-                None,
-                **LK_PARAMS
-            )
+            bbox = ctx.last_bbox if ctx.last_bbox is not None else self._bbox_from_polygon(annotation["polygon"])
+            match_bbox, score = self._match_template(gray, ctx, bbox)
 
-            fb_error = np.linalg.norm(ctx.prev_points - back_points, axis=2)
-            good_mask = (
-                (status.flatten() == 1)
-                & (back_status.flatten() == 1)
-                & (fb_error.flatten() < self.forward_backward_tol)
-            )
-
-            prev_good = ctx.prev_points[good_mask]
-            next_good = next_points[good_mask]
-
-            if prev_good is None or len(prev_good) < self.min_feature_threshold:
-                ctx.prev_points = None
-                ctx.status = "reinit"
-                ctx.lost_frames += 1
+            if match_bbox is None or score < self.template_match_threshold:
+                ctx.status = "insufficient"
                 continue
 
-            matrix, inliers = cv2.estimateAffinePartial2D(
-                prev_good,
-                next_good,
-                method=cv2.RANSAC,
-                ransacReprojThreshold=3.0
-            )
+            ctx.last_bbox = match_bbox
+            ctx.last_score = score
+            detections.append((annotation["id"], match_bbox, score))
 
-            if matrix is None or inliers is None or int(inliers.sum()) < self.min_feature_threshold:
-                ctx.prev_points = None
-                ctx.status = "reinit"
-                ctx.lost_frames += 1
-                continue
+        return detections
 
-            new_polygon = cv2.transform(
-                annotation["polygon"].reshape(-1, 1, 2),
-                matrix
-            ).reshape(-1, 2)
+    def _match_template(
+        self,
+        gray_frame: np.ndarray,
+        ctx: TrackerContext,
+        bbox: Tuple[float, float, float, float]
+    ) -> Tuple[Optional[Tuple[float, float, float, float]], float]:
+        x, y, w, h = bbox
+        template = ctx.template
+        if template is None:
+            return None, 0.0
 
-            self._update_annotation_geometry(annotation, new_polygon)
-            ctx.prev_points = next_good.reshape(-1, 1, 2).astype(np.float32)
-            ctx.status = "tracking"
-            ctx.lost_frames = 0
+        search_w = int(w * self.search_scale)
+        search_h = int(h * self.search_scale)
+        center_x = int(x + w / 2)
+        center_y = int(y + h / 2)
+        x1 = max(0, center_x - search_w // 2)
+        y1 = max(0, center_y - search_h // 2)
+        x2 = min(self.width, x1 + search_w)
+        y2 = min(self.height, y1 + search_h)
 
-            if len(ctx.prev_points) < self.min_feature_threshold + 4:
-                ctx.reinit_frame = self.frame_number
-                self._initialize_tracker(annotation, gray)
+        search_region = gray_frame[y1:y2, x1:x2]
+        if search_region.shape[0] < template.shape[0] or search_region.shape[1] < template.shape[1]:
+            search_region = gray_frame
+            x1, y1 = 0, 0
 
-            if ctx.lost_frames > self.max_lost_frames:
-                ctx.status = "lost"
-                ctx.prev_points = None
+        
+        blurred_region = cv2.GaussianBlur(search_region, (3, 3), 0)
+        blurred_template = cv2.GaussianBlur(template, (3, 3), 0)
+        result = cv2.matchTemplate(blurred_region, blurred_template, cv2.TM_CCOEFF_NORMED)
+        
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        top_left = (x1 + max_loc[0], y1 + max_loc[1])
+
+        new_bbox = (
+            float(top_left[0]),
+            float(top_left[1]),
+            float(ctx.template_size[0]),
+            float(ctx.template_size[1])
+        )
+
+        return new_bbox, float(max_val)
+
+    def _extract_template(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[float, float, float, float]
+    ) -> Optional[np.ndarray]:
+        x, y, w, h = bbox
+        x1 = int(max(0, x))
+        y1 = int(max(0, y))
+        x2 = int(min(self.width, x + w))
+        y2 = int(min(self.height, y + h))
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+
+        return cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    def _bbox_from_polygon(self, polygon: np.ndarray) -> Tuple[float, float, float, float]:
+        bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(polygon.astype(np.int32))
+        return float(bbox_x), float(bbox_y), float(bbox_w), float(bbox_h)
+
+    def _apply_bbox_update(self, annotation: Dict[str, object], bbox: Tuple[float, float, float, float]) -> None:
+        x, y, w, h = bbox
+        polygon = annotation["polygon"].astype(np.float32)
+        if polygon.size == 0:
+            return
+
+        new_center = np.array([x + w / 2.0, y + h / 2.0], dtype=np.float32)
+        current_center = np.mean(polygon, axis=0)
+        translation = new_center - current_center
+
+        transformed = polygon + translation
+        self._update_annotation_geometry(annotation, transformed)
     
     # ------------------------------------------------------------------
     # Geometry + metadata updates
@@ -299,6 +486,30 @@ class MedicalAnnotationTool:
                 dtype=np.float32
             )
             return polygon
+        if len(pts) >= 3:
+            curve = pts.reshape(-1, 1, 2)
+            epsilon = max(2.0, 0.01 * cv2.arcLength(curve, False))
+            polygon = cv2.approxPolyDP(curve, epsilon, True).reshape(-1, 2)
+            if polygon.shape[0] >= 3:
+                return polygon.astype(np.float32)
+            hull = cv2.convexHull(pts)
+            if hull.shape[0] >= 3:
+                return hull.reshape(-1, 2).astype(np.float32)
+        if len(pts) >= 2:
+            x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
+            if w == 0:
+                w = 2
+            if h == 0:
+                h = 2
+            return np.array(
+                [
+                    [x, y],
+                    [x + w, y],
+                    [x + w, y + h],
+                    [x, y + h]
+                ],
+                dtype=np.float32
+            )
         return pts
 
     def _compute_annotation_metadata(self, polygon: np.ndarray) -> Dict[str, object]:
@@ -447,7 +658,7 @@ class MedicalAnnotationTool:
         y += 24
         status_text = "PAUSED" if self.paused else "PLAYING"
         tracking_text = "ON" if self.tracking_enabled else "OFF"
-        cv2.putText(display, f"Status: {status_text}   Tracking: {tracking_text}   Frame: {self.frame_number}/{self.total_frames}", (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 255, 180), 1)
+        cv2.putText(display, f"Status: {status_text}   Tracking: {tracking_text}   Frame: {self.frame_number}/{self.total_frames}   FPS: {self.fps:.2f}", (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 255, 180), 1)
         y += 22
         cv2.putText(display, f"Active annotations: {len(self.annotations)}", (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
@@ -461,7 +672,7 @@ class MedicalAnnotationTool:
             print("\nNo annotations to save.")
             return
 
-        output_dir = Path("/Users/santhosh/Desktop/code/annotations")
+        output_dir = self.project_root / "annotations"
         output_dir.mkdir(exist_ok=True)
 
         video_name = Path(self.video_path).stem if self.video_path else "video"
@@ -519,7 +730,6 @@ class MedicalAnnotationTool:
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
 
         self.paused = True
-        self.prev_gray = None
 
         while True:
             if not self.paused:
@@ -529,12 +739,7 @@ class MedicalAnnotationTool:
                     break
                 self.current_frame = frame
                 self.frame_number = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                self.current_gray = gray
-
-                if self.prev_gray is not None:
-                    self.track_annotations(self.prev_gray, gray)
-                self.prev_gray = gray
+                self.track_annotations(self.current_frame)
             else:
                 if self.current_frame is None:
                     ret, frame = self.cap.read()
@@ -542,10 +747,6 @@ class MedicalAnnotationTool:
                         break
                     self.current_frame = frame
                     self.frame_number = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                if self.current_gray is None and self.current_frame is not None:
-                    self.current_gray = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2GRAY)
-                if self.prev_gray is None and self.current_gray is not None:
-                    self.prev_gray = self.current_gray.copy()
 
             if self.current_frame is None:
                 continue
@@ -596,253 +797,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     
-    def draw_annotations_on_frame(self, frame):
-        """Draw all annotations on the current frame with CSRT tracking status."""
-        display = frame.copy()
-        
-        # Draw all completed annotations
-        for i, ann in enumerate(self.annotations):
-            points = np.array(ann['points'], dtype=np.int32)
-            ann_id = ann['id']
-            
-            # Color based on CSRT tracking status
-            status = self.tracking_status.get(ann_id, 'unknown')
-            if status == 'tracking':
-                color = (0, 255, 0)  # Green - tracking active
-                status_text = "CSRT"
-            elif status == 'lost':
-                color = (0, 0, 255)  # Red - tracking lost
-                status_text = "LOST"
-            elif status == 'initialized':
-                color = (0, 255, 255)  # Yellow - initialized, waiting
-                status_text = "INIT"
-            elif status == 'ready':
-                color = (200, 200, 200)  # Gray - ready to track
-                status_text = "READY"
-            else:
-                color = (100, 100, 100)  # Dark gray - unknown
-                status_text = "?"
-            
-            if not self.tracking_enabled:
-                color = (128, 128, 128)  # Gray - tracking disabled
-                status_text = "OFF"
-            
-            # Draw rectangle
-            if ann['type'] == 'rectangle' and len(points) == 2:
-                cv2.rectangle(display, tuple(points[0]), tuple(points[1]), color, 2)
-                cv2.putText(display, f"#{i+1}", tuple(points[0]), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            else:
-                cv2.polylines(display, [points], True, color, 2)
-                cv2.putText(display, f"#{i+1}", tuple(points[0]), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Show offset and tracking status
-            offset_text = f"({ann['offset']['x']:.0f},{ann['offset']['y']:.0f}) [{status_text}]"
-            cv2.putText(display, offset_text, (points[0][0], points[0][1] - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-        
-        # Draw current annotation being drawn
-        if len(self.current_annotation) > 0:
-            points = np.array(self.current_annotation, dtype=np.int32)
-            for i, pt in enumerate(points):
-                cv2.circle(display, tuple(pt), 5, (0, 0, 255), -1)
-                # Show point numbers
-                cv2.putText(display, str(i+1), (pt[0]+10, pt[1]-10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-            
-            if len(points) > 1:
-                # Draw lines connecting points
-                cv2.polylines(display, [points], False, (0, 0, 255), 2)
-                
-                # Show preview of closing line for polygons (3+ points)
-                if len(points) >= 3:
-                    cv2.line(display, tuple(points[-1]), tuple(points[0]), (255, 0, 255), 1)
-        
-        return display
-    
-    def add_ui_overlay(self, frame):
-        """Add UI instructions and CSRT tracking info overlay."""
-        display = frame.copy()
-        
-        # Semi-transparent panel at top
-        overlay = display.copy()
-        cv2.rectangle(overlay, (0, 0), (display.shape[1], 140), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.7, display, 0.3, 0, display)
-        
-        # Instructions
-        y = 25
-        cv2.putText(display, "CONTROLS:", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        y += 25
-        cv2.putText(display, "SPACE: Pause/Play  |  LEFT CLICK: Add Point  |  RIGHT CLICK: Complete", 
-                   (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        y += 20
-        cv2.putText(display, "T: Toggle Tracking  |  C: Clear Current  |  S: Save  |  Q/ESC: Quit", 
-                   (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        
-        # Status and Algorithm Info
-        y += 25
-        status = "PAUSED" if self.paused else "PLAYING"
-        status_color = (0, 255, 255) if self.paused else (0, 255, 0)
-        tracking_status = "ON" if self.tracking_enabled else "OFF"
-        cv2.putText(display, f"Status: {status}  |  CSRT-Like Tracking: {tracking_status}  |  Frame: {self.frame_number}/{self.total_frames}  |  Annotations: {len(self.annotations)}", 
-                   (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
-        
-        # CSRT Algorithm Info
-        y += 18
-        csrt_info = "CSRT-Like: Dense Optical Flow + Kalman Filtering"
-        cv2.putText(display, csrt_info, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 255, 100), 1)
-        
-        return display
-        return display
-    
-    def run(self):
-        """Run the annotation tool."""
-        # Select and load video (skip selection if path already set)
-        if not self.video_path:
-            if not self.select_video():
-                return
-        
-        if not self.load_video():
-            return
-        
-        print("\n" + "=" * 60)
-        print("ANNOTATION TOOL STARTED")
-        print("=" * 60)
-        print("\nCONTROLS:")
-        print("  SPACE        - Pause/Play video")
-        print("  LEFT CLICK   - Add annotation point")
-        print("  RIGHT CLICK  - Complete annotation (2+ points)")
-        print("  C            - Clear current annotation")
-        print("  S            - Save annotations to JSON")
-        print("  Q or ESC     - Quit")
-        print("\nTIP: Pause the video (SPACE) before annotating")
-        print("=" * 60 + "\n")
-        
-        # Create window and set mouse callback
-        cv2.namedWindow(self.window_name)
-        cv2.setMouseCallback(self.window_name, self.mouse_callback)
-        
-        # Start paused
-        self.paused = True
-        
-        while True:
-            if not self.paused:
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("\nEnd of video reached.")
-                    break
-                self.current_frame = frame
-                self.frame_number = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            
-            if self.current_frame is None:
-                ret, frame = self.cap.read()
-                if not ret:
-                    break
-                self.current_frame = frame
-                self.frame_number = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            
-            # Track annotations using CSRT
-            if not self.paused and self.tracking_enabled:
-                self.track_annotations(self.current_frame)
-            
-            # Draw annotations and UI
-            display = self.draw_annotations_on_frame(self.current_frame)
-            display = self.add_ui_overlay(display)
-            
-            cv2.imshow(self.window_name, display)
-            
-            # Handle keyboard input
-            key = cv2.waitKey(30 if not self.paused else 1) & 0xFF
-            
-            if key == ord(' '):  # Space - toggle pause
-                self.paused = not self.paused
-                print(f"\n{'PAUSED' if self.paused else 'PLAYING'}")
-            
-            elif key == ord('t') or key == ord('T'):  # Toggle tracking
-                self.tracking_enabled = not self.tracking_enabled
-                print(f"\nCSRT Tracking {'ENABLED' if self.tracking_enabled else 'DISABLED'}")
-            
-            elif key == ord('c') or key == ord('C'):  # Clear current annotation
-                if self.current_annotation:
-                    self.current_annotation = []
-                    self.drawing = False
-                    print("\nCurrent annotation cleared")
-            
-            elif key == ord('s') or key == ord('S'):  # Save annotations
-                self.save_annotations()
-            
-            elif key == ord('q') or key == 27:  # Q or ESC - quit
-                print("\nQuitting...")
-                break
-        
-        # Cleanup
-        self.cap.release()
-        cv2.destroyAllWindows()
-        
-        # Ask to save before exit
-        if self.annotations:
-            print(f"\nYou have {len(self.annotations)} annotation(s).")
-            save = input("Save annotations before exit? (y/n): ")
-            if save.lower() == 'y':
-                self.save_annotations()
-    
-    def save_annotations(self):
-        """Save annotations to JSON file."""
-        if not self.annotations:
-            print("\nNo annotations to save!")
-            return
-        
-        # Create output directory
-        output_dir = Path("/Users/santhosh/Desktop/code/annotations")
-        output_dir.mkdir(exist_ok=True)
-        
-        # Generate filename
-        video_name = Path(self.video_path).stem
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = output_dir / f"{video_name}_annotations_{timestamp}.json"
-        
-        # Prepare data
-        data = {
-            'video_path': self.video_path,
-            'video_name': Path(self.video_path).name,
-            'video_properties': {
-                'width': self.width,
-                'height': self.height,
-                'fps': self.fps,
-                'total_frames': self.total_frames
-            },
-            'annotation_count': len(self.annotations),
-            'annotations': self.annotations,
-            'created_at': datetime.now().isoformat()
-        }
-        
-        # Save to JSON
-        with open(output_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        print(f"\n✓ Annotations saved to: {output_file}")
-        print(f"  Total annotations: {len(self.annotations)}")
-        
-        # Print summary
-        print("\nAnnotation Summary:")
-        for i, ann in enumerate(self.annotations, 1):
-            print(f"  #{i}: Frame {ann['frame']}, Type: {ann['type']}, Points: {len(ann['points'])}")
-
-
-def main():
-    """Main entry point."""
-    import sys
-    
-    tool = AnnotationTool()
-    
-    # If video path provided as argument, use it directly
-    if len(sys.argv) > 1:
-        tool.video_path = sys.argv[1]
-        print(f"\nUsing video: {tool.video_path}")
-    
-    tool.run()
-
-
-if __name__ == "__main__":
-    main()
