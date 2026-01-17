@@ -1,0 +1,86 @@
+{
+  "video_path": "/Users/santhosh/Desktop/hackathon/holoray/Dataset/Lapchole/Lapchole1.mp4",
+  "video_name": "Lapchole1.mp4",
+  "video_properties": {
+    "width": 1134,
+    "height": 748,
+    "fps": 30.0,
+    "total_frames": 1030
+  },
+  "annotation_count": 1,
+  "annotations": [
+    {
+      "id": 1,
+      "frame": 1,
+      "start_frame": 1,
+      "points": [
+        [
+          430,
+          380
+        ],
+        [
+          493,
+          414
+        ]
+      ],
+      "original_points": [
+        [
+          430,
+          380
+        ],
+        [
+          493,
+          414
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 0.03333333333333333,
+      "offset": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "metadata": {
+        "bounding_box": {
+          "x_min": 430,
+          "y_min": 380,
+          "x_max": 493,
+          "y_max": 414,
+          "width": 63,
+          "height": 34
+        },
+        "center": {
+          "x": 461.5,
+          "y": 397.0
+        },
+        "area_pixels": 2142.0,
+        "num_points": 2,
+        "color_statistics": {
+          "mean_rgb": [
+            149.54910714285714,
+            180.73705357142856,
+            209.7044642857143
+          ],
+          "std_rgb": [
+            46.67862484114061,
+            53.3731562267426,
+            45.72945652810524
+          ],
+          "median_rgb": [
+            154.0,
+            186.0,
+            222.0
+          ]
+        },
+        "intensity_statistics": {
+          "mean": 185.8580357142857,
+          "std": 49.82962425389578,
+          "min": 8,
+          "max": 252,
+          "median": 193.0
+        },
+        "region_pixel_count": 2240
+      }
+    }
+  ],
+  "created_at": "2026-01-17T15:12:49.740490"
+}

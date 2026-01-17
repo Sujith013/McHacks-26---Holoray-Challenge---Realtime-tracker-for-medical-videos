@@ -1,0 +1,59 @@
+{
+  "video_path": "/Users/santhosh/Desktop/hackathon/holoray/Dataset/Intrapartum/Intrapartum-probe_movement.mp4",
+  "video_name": "Intrapartum-probe_movement.mp4",
+  "video_properties": {
+    "width": 512,
+    "height": 512,
+    "fps": 24.0,
+    "total_frames": 778
+  },
+  "annotation_count": 3,
+  "annotations": [
+    {
+      "frame": 1,
+      "points": [
+        [
+          88,
+          266
+        ],
+        [
+          146,
+          315
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 0.041666666666666664
+    },
+    {
+      "frame": 57,
+      "points": [
+        [
+          302,
+          244
+        ],
+        [
+          343,
+          259
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 2.375
+    },
+    {
+      "frame": 192,
+      "points": [
+        [
+          297,
+          341
+        ],
+        [
+          359,
+          379
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 8.0
+    }
+  ],
+  "created_at": "2026-01-17T15:02:00.166820"
+}

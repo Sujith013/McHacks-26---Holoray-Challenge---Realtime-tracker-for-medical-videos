@@ -1,0 +1,86 @@
+{
+  "video_path": "/Users/santhosh/Desktop/hackathon/holoray/Dataset/Intrapartum/Intrapartum-typical.mp4",
+  "video_name": "Intrapartum-typical.mp4",
+  "video_properties": {
+    "width": 512,
+    "height": 512,
+    "fps": 24.0,
+    "total_frames": 257
+  },
+  "annotation_count": 1,
+  "annotations": [
+    {
+      "id": 1,
+      "frame": 1,
+      "start_frame": 1,
+      "points": [
+        [
+          303,
+          331
+        ],
+        [
+          380,
+          365
+        ]
+      ],
+      "original_points": [
+        [
+          303,
+          331
+        ],
+        [
+          380,
+          365
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 0.041666666666666664,
+      "offset": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "metadata": {
+        "bounding_box": {
+          "x_min": 303,
+          "y_min": 331,
+          "x_max": 380,
+          "y_max": 365,
+          "width": 77,
+          "height": 34
+        },
+        "center": {
+          "x": 341.5,
+          "y": 348.0
+        },
+        "area_pixels": 2618.0,
+        "num_points": 2,
+        "color_statistics": {
+          "mean_rgb": [
+            57.64212454212454,
+            57.64212454212454,
+            57.64212454212454
+          ],
+          "std_rgb": [
+            31.005950957094026,
+            31.005950957094026,
+            31.005950957094026
+          ],
+          "median_rgb": [
+            51.0,
+            51.0,
+            51.0
+          ]
+        },
+        "intensity_statistics": {
+          "mean": 57.64212454212454,
+          "std": 31.005950957094026,
+          "min": 2,
+          "max": 190,
+          "median": 51.0
+        },
+        "region_pixel_count": 2730
+      }
+    }
+  ],
+  "created_at": "2026-01-17T15:11:34.968324"
+}

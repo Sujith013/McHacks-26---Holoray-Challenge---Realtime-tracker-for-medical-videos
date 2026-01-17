@@ -1,0 +1,185 @@
+{
+  "video_path": "/Users/santhosh/Desktop/hackathon/holoray/Dataset/Intrapartum/Intrapartum-probe_movement.mp4",
+  "video_name": "Intrapartum-probe_movement.mp4",
+  "video_properties": {
+    "width": 512,
+    "height": 512,
+    "fps": 24.0,
+    "total_frames": 778
+  },
+  "annotation_count": 3,
+  "annotations": [
+    {
+      "id": 1,
+      "frame": 1,
+      "points": [
+        [
+          86,
+          271
+        ],
+        [
+          148,
+          311
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 0.041666666666666664,
+      "metadata": {
+        "bounding_box": {
+          "x_min": 86,
+          "y_min": 271,
+          "x_max": 148,
+          "y_max": 311,
+          "width": 62,
+          "height": 40
+        },
+        "center": {
+          "x": 117.0,
+          "y": 291.0
+        },
+        "area_pixels": 2480.0,
+        "num_points": 2,
+        "color_statistics": {
+          "mean_rgb": [
+            74.58188153310104,
+            74.58188153310104,
+            74.58188153310104
+          ],
+          "std_rgb": [
+            55.22258634478942,
+            55.22258634478942,
+            55.22258634478942
+          ],
+          "median_rgb": [
+            54.0,
+            54.0,
+            54.0
+          ]
+        },
+        "intensity_statistics": {
+          "mean": 74.58188153310104,
+          "std": 55.22258634478942,
+          "min": 0,
+          "max": 255,
+          "median": 54.0
+        },
+        "region_pixel_count": 2583
+      }
+    },
+    {
+      "id": 2,
+      "frame": 1,
+      "points": [
+        [
+          288,
+          152
+        ],
+        [
+          361,
+          157
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 0.041666666666666664,
+      "metadata": {
+        "bounding_box": {
+          "x_min": 288,
+          "y_min": 152,
+          "x_max": 361,
+          "y_max": 157,
+          "width": 73,
+          "height": 5
+        },
+        "center": {
+          "x": 324.5,
+          "y": 154.5
+        },
+        "area_pixels": 365.0,
+        "num_points": 2,
+        "color_statistics": {
+          "mean_rgb": [
+            47.6509009009009,
+            47.6509009009009,
+            47.6509009009009
+          ],
+          "std_rgb": [
+            14.127706600257955,
+            14.127706600257955,
+            14.127706600257955
+          ],
+          "median_rgb": [
+            48.0,
+            48.0,
+            48.0
+          ]
+        },
+        "intensity_statistics": {
+          "mean": 47.6509009009009,
+          "std": 14.127706600257955,
+          "min": 12,
+          "max": 75,
+          "median": 48.0
+        },
+        "region_pixel_count": 444
+      }
+    },
+    {
+      "id": 3,
+      "frame": 1,
+      "points": [
+        [
+          288,
+          188
+        ],
+        [
+          348,
+          124
+        ]
+      ],
+      "type": "rectangle",
+      "timestamp": 0.041666666666666664,
+      "metadata": {
+        "bounding_box": {
+          "x_min": 288,
+          "y_min": 124,
+          "x_max": 348,
+          "y_max": 188,
+          "width": 60,
+          "height": 64
+        },
+        "center": {
+          "x": 318.0,
+          "y": 156.0
+        },
+        "area_pixels": 3840.0,
+        "num_points": 2,
+        "color_statistics": {
+          "mean_rgb": [
+            42.21286254728878,
+            42.21286254728878,
+            42.21286254728878
+          ],
+          "std_rgb": [
+            14.340995338236505,
+            14.340995338236505,
+            14.340995338236505
+          ],
+          "median_rgb": [
+            42.0,
+            42.0,
+            42.0
+          ]
+        },
+        "intensity_statistics": {
+          "mean": 42.21286254728878,
+          "std": 14.340995338236505,
+          "min": 10,
+          "max": 107,
+          "median": 42.0
+        },
+        "region_pixel_count": 3965
+      }
+    }
+  ],
+  "created_at": "2026-01-17T15:08:48.659220"
+}
