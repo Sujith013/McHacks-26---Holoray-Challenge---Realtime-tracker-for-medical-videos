@@ -15,14 +15,23 @@ import numpy as np
 class TrackerContext:
     """State container for per-annotation tracking."""
 
-    template: Optional[np.ndarray] = None
-    template_size: Tuple[int, int] = (0, 0)
+    # Optical flow state
+    prev_gray: Optional[np.ndarray] = None
+    prev_pts: Optional[np.ndarray] = None
+    initial_pts: Optional[np.ndarray] = None
+    affine_matrix: Optional[np.ndarray] = None
+    confidence: float = 0.0
+
+    # Template EMA (for optional reuse/redetection)
+    ema_template: Optional[np.ndarray] = None
+    ema_alpha: float = 0.15
+
+    # Bookkeeping
     last_bbox: Optional[Tuple[float, float, float, float]] = None
-    track_id: Optional[int] = None
     status: str = "initializing"
     lost_frames: int = 0
     total_offset: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
-    last_score: float = 0.0
+    active_pts: int = 0
 
 
 @dataclass
@@ -184,9 +193,10 @@ class MedicalAnnotationTool:
         self.drawing: bool = False
 
         self.max_lost_frames: int = 20
-        self.template_match_threshold: float = 0.6
-        self.search_scale: float = 2.0
-        self.byte_tracker = ByteTracker(match_thresh=0.3, track_buffer=self.max_lost_frames)
+        self.min_points: int = 8
+        self.redetect_thresh: float = 0.25  # confidence threshold to trigger re-detect
+        self.lost_conf_thresh: float = 0.12
+        self.high_conf_thresh: float = 0.45
 
     # ------------------------------------------------------------------
     # Video lifecycle
@@ -321,23 +331,30 @@ class MedicalAnnotationTool:
             ctx.status = "unavailable"
             return
 
-        bbox = self._bbox_from_polygon(annotation["polygon"])
-        template = self._extract_template(frame, bbox)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        if template is None:
-            ctx.template = None
-            ctx.template_size = (0, 0)
-            ctx.last_bbox = None
+        bbox = self._bbox_from_polygon(annotation["polygon"])
+        roi = self._extract_template(frame, bbox)
+        if roi is None or roi.size == 0:
             ctx.status = "insufficient"
             return
 
-        ctx.template = template
-        ctx.template_size = (template.shape[1], template.shape[0])
+        keypoints = self._detect_keypoints(gray, annotation["polygon"], max_corners=80)
+        if keypoints is None or len(keypoints) < self.min_points:
+            ctx.status = "insufficient"
+            return
+
+        ctx.prev_gray = gray
+        ctx.prev_pts = keypoints
+        ctx.initial_pts = keypoints.copy()
+        ctx.affine_matrix = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        ctx.confidence = 1.0
         ctx.last_bbox = bbox
-        ctx.status = "ready"
         ctx.lost_frames = 0
-        ctx.last_score = 1.0
         ctx.total_offset = np.zeros(2, dtype=np.float32)
+        ctx.active_pts = int(len(keypoints))
+
+        ctx.ema_template = roi.astype(np.float32)
 
     def track_annotations(self, frame: np.ndarray) -> None:
         if not self.tracking_enabled:
@@ -345,90 +362,96 @@ class MedicalAnnotationTool:
                 ann["tracker"].status = "paused"
             return
 
-        detections = self._generate_detections(frame)
-        track_map = self.byte_tracker.update(detections)
-
-        for annotation in self.annotations:
-            ctx: TrackerContext = annotation["tracker"]
-            track_state = track_map.get(annotation["id"])
-
-            if track_state and track_state.state == "tracked":
-                ctx.track_id = track_state.track_id
-                ctx.last_bbox = track_state.bbox
-                ctx.last_score = track_state.score
-                ctx.status = "tracking"
-                ctx.lost_frames = 0
-                self._apply_bbox_update(annotation, track_state.bbox)
-            else:
-                ctx.lost_frames += 1
-                if ctx.lost_frames > self.max_lost_frames:
-                    ctx.status = "lost"
-                else:
-                    ctx.status = "reinit"
-
-    def _generate_detections(self, frame: np.ndarray) -> List[Tuple[int, Tuple[float, float, float, float], float]]:
-        detections: List[Tuple[int, Tuple[float, float, float, float], float]] = []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         for annotation in self.annotations:
             ctx: TrackerContext = annotation["tracker"]
-            if ctx.template is None or ctx.template_size == (0, 0):
+            if ctx.prev_gray is None or ctx.prev_pts is None or len(ctx.prev_pts) < self.min_points:
+                # Try to reinitialize if we have a frame.
+                self._initialize_tracker(annotation, frame)
                 continue
 
-            bbox = ctx.last_bbox if ctx.last_bbox is not None else self._bbox_from_polygon(annotation["polygon"])
-            match_bbox, score = self._match_template(gray, ctx, bbox)
+            self._track_with_optical_flow(annotation, frame, gray)
 
-            if match_bbox is None or score < self.template_match_threshold:
-                ctx.status = "insufficient"
-                continue
+    # Optical-flow tracking pipeline
+    def _track_with_optical_flow(self, annotation: Dict[str, object], frame: np.ndarray, gray: np.ndarray) -> None:
+        ctx: TrackerContext = annotation["tracker"]
 
-            ctx.last_bbox = match_bbox
-            ctx.last_score = score
-            detections.append((annotation["id"], match_bbox, score))
-
-        return detections
-
-    def _match_template(
-        self,
-        gray_frame: np.ndarray,
-        ctx: TrackerContext,
-        bbox: Tuple[float, float, float, float]
-    ) -> Tuple[Optional[Tuple[float, float, float, float]], float]:
-        x, y, w, h = bbox
-        template = ctx.template
-        if template is None:
-            return None, 0.0
-
-        search_w = int(w * self.search_scale)
-        search_h = int(h * self.search_scale)
-        center_x = int(x + w / 2)
-        center_y = int(y + h / 2)
-        x1 = max(0, center_x - search_w // 2)
-        y1 = max(0, center_y - search_h // 2)
-        x2 = min(self.width, x1 + search_w)
-        y2 = min(self.height, y1 + search_h)
-
-        search_region = gray_frame[y1:y2, x1:x2]
-        if search_region.shape[0] < template.shape[0] or search_region.shape[1] < template.shape[1]:
-            search_region = gray_frame
-            x1, y1 = 0, 0
-
-        
-        blurred_region = cv2.GaussianBlur(search_region, (3, 3), 0)
-        blurred_template = cv2.GaussianBlur(template, (3, 3), 0)
-        result = cv2.matchTemplate(blurred_region, blurred_template, cv2.TM_CCOEFF_NORMED)
-        
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-        top_left = (x1 + max_loc[0], y1 + max_loc[1])
-
-        new_bbox = (
-            float(top_left[0]),
-            float(top_left[1]),
-            float(ctx.template_size[0]),
-            float(ctx.template_size[1])
+        next_pts, status, error = cv2.calcOpticalFlowPyrLK(
+            ctx.prev_gray,
+            gray,
+            ctx.prev_pts,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         )
 
-        return new_bbox, float(max_val)
+        if next_pts is None or status is None:
+            ctx.lost_frames += 1
+            if ctx.lost_frames > self.max_lost_frames:
+                ctx.status = "lost"
+            return
+
+        good_prev = ctx.prev_pts[status.reshape(-1) == 1]
+        good_next = next_pts[status.reshape(-1) == 1]
+
+        if len(good_prev) < self.min_points or len(good_next) < self.min_points:
+            # Too few points, attempt re-detect.
+            if self._redetect_keypoints(ctx, gray, annotation["polygon"]):
+                ctx.status = "reinit"
+            else:
+                ctx.lost_frames += 1
+                if ctx.lost_frames > self.max_lost_frames:
+                    ctx.status = "lost"
+            return
+
+        M, inliers = cv2.estimateAffinePartial2D(
+            good_prev,
+            good_next,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.99
+        )
+
+        if M is None:
+            ctx.lost_frames += 1
+            if ctx.lost_frames > self.max_lost_frames:
+                ctx.status = "lost"
+            return
+
+        inlier_ratio = float(np.mean(inliers)) if inliers is not None and len(inliers) > 0 else 0.0
+        tracked_ratio = float(len(good_prev)) / max(len(ctx.initial_pts) if ctx.initial_pts is not None else len(good_prev), 1)
+        confidence = inlier_ratio * tracked_ratio
+
+        ctx.affine_matrix = M.astype(np.float32)
+        ctx.confidence = confidence
+        ctx.active_pts = int(len(good_prev))
+
+        self._apply_affine_update(annotation, M)
+
+        # Update template EMA only when confident to reduce drift.
+        if confidence >= self.high_conf_thresh:
+            self._update_template_ema(ctx, gray, annotation["polygon"])
+
+        # Maintain point set for next frame (keep inliers if available).
+        if inliers is not None and len(inliers) == len(good_prev):
+            good_prev = good_prev[inliers.reshape(-1) == 1]
+            good_next = good_next[inliers.reshape(-1) == 1]
+
+        if len(good_next) < self.min_points or confidence < self.redetect_thresh:
+            self._redetect_keypoints(ctx, gray, annotation["polygon"])
+        else:
+            ctx.prev_pts = good_next.reshape(-1, 1, 2).astype(np.float32)
+            ctx.prev_gray = gray
+            ctx.status = "tracking"
+            ctx.lost_frames = 0
+
+        if confidence < self.lost_conf_thresh:
+            ctx.lost_frames += 1
+            if ctx.lost_frames > self.max_lost_frames:
+                ctx.status = "lost"
 
     def _extract_template(
         self,
@@ -449,6 +472,62 @@ class MedicalAnnotationTool:
             return None
 
         return cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    def _detect_keypoints(self, gray_frame: np.ndarray, polygon: np.ndarray, max_corners: int = 60) -> Optional[np.ndarray]:
+        mask = np.zeros_like(gray_frame, dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
+        pts = cv2.goodFeaturesToTrack(
+            gray_frame,
+            maxCorners=max_corners,
+            qualityLevel=0.01,
+            minDistance=5,
+            mask=mask,
+            blockSize=7
+        )
+        return pts
+
+    def _redetect_keypoints(self, ctx: TrackerContext, gray_frame: np.ndarray, polygon: np.ndarray) -> bool:
+        pts = self._detect_keypoints(gray_frame, polygon, max_corners=80)
+        if pts is None or len(pts) < self.min_points:
+            return False
+        ctx.prev_pts = pts.astype(np.float32)
+        ctx.initial_pts = pts.astype(np.float32)
+        ctx.prev_gray = gray_frame
+        ctx.active_pts = int(len(pts))
+        ctx.confidence = 0.0
+        ctx.lost_frames = 0
+        ctx.status = "reinit"
+        return True
+
+    def _apply_affine_update(self, annotation: Dict[str, object], M: np.ndarray) -> None:
+        polygon = annotation["polygon"].astype(np.float32)
+        if polygon.size == 0:
+            return
+
+        ones = np.ones((polygon.shape[0], 1), dtype=np.float32)
+        homo = np.hstack([polygon, ones])  # Nx3
+        transformed = (M @ homo.T).T
+
+        transformed[:, 0] = np.clip(transformed[:, 0], 0, self.width - 1)
+        transformed[:, 1] = np.clip(transformed[:, 1], 0, self.height - 1)
+
+        self._update_annotation_geometry(annotation, transformed)
+
+    def _update_template_ema(self, ctx: TrackerContext, gray_frame: np.ndarray, polygon: np.ndarray) -> None:
+        x, y, w, h = self._bbox_from_polygon(polygon)
+        roi = gray_frame[int(y):int(y + h), int(x):int(x + w)]
+        if roi.size == 0:
+            return
+        if ctx.ema_template is None:
+            ctx.ema_template = roi.astype(np.float32)
+        else:
+            alpha = ctx.ema_alpha
+            # If size changed, reset EMA to avoid shape mismatch.
+            if ctx.ema_template.shape != roi.shape:
+                ctx.ema_template = roi.astype(np.float32)
+                return
+            # EMA to adapt appearance while limiting drift.
+            ctx.ema_template = alpha * roi.astype(np.float32) + (1 - alpha) * ctx.ema_template
 
     def _bbox_from_polygon(self, polygon: np.ndarray) -> Tuple[float, float, float, float]:
         bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(polygon.astype(np.int32))
@@ -779,10 +858,7 @@ class MedicalAnnotationTool:
         if self.cap:
             self.cap.release()
 
-        if self.annotations:
-            save = input("\nSave annotations before exit? (y/n): ").strip().lower()
-            if save == 'y':
-                self.save_annotations()
+        # Exit silently; annotations must be saved explicitly via the S key during use.
 
 
 def main() -> None:
