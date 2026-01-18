@@ -172,7 +172,8 @@ def track_frame(tracker, frame):
         frame: Current frame (BGR format from cv2)
         
     Returns:
-        bbox: [x, y, w, h] or None if tracking failed
+        tuple: (bbox, confidence) where bbox is [x, y, w, h] and confidence is a float
+               Returns (None, 0.0) if tracking failed
     """
     try:
         # Convert to RGB
@@ -184,12 +185,14 @@ def track_frame(tracker, frame):
         if 'target_bbox' in out:  
             bbox = out['target_bbox']
             # OSTrack returns [x, y, w, h]
-            return [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+            confidence = out.get('confidence', 0.0)
+            
+            return [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])], confidence
         else:
-            return None
+            return None, 0.0
     except Exception as e:
         print(f"Tracking error: {e}")
-        return None
+        return None, 0.0
 
 
 def calculate_fps():
@@ -225,7 +228,17 @@ if __name__ == "__main__":
         choices=["vitb_256_mae_ce_32x4_ep300", "vitb_384_mae_ce_32x4_ep300"],
         help="OSTrack model config"
     )
+    parser.add_argument(
+        "--confidence-threshold",
+        "-c",
+        default=0.3,
+        type=float,
+        help="Confidence threshold for displaying bounding box (0.0-1.0). Lower values show more boxes during occlusions."
+    )
     args = parser.parse_args()
+    
+    # Confidence threshold for occlusion detection
+    confidence_threshold = args.confidence_threshold
 
     data_path = "../Dataset"
     video_paths = []
@@ -241,8 +254,8 @@ if __name__ == "__main__":
             video_paths.append(os.path.join(data_path, x, y))
             print(f"{len(video_paths)}. {video_paths[-1]}")
     
-    video_index = int(input("\nEnter the video number: ").strip())
-    video_path = video_paths[video_index - 1]
+    video_number = input("\nEnter the video number: ").strip()
+    video_path = video_paths[int(video_number) - 1]
 
     # Initialize OSTrack
     print("\n" + "="*60)
@@ -289,19 +302,34 @@ if __name__ == "__main__":
 
             if tracking_active:
                 # Use OSTrack to track
-                bbox = track_frame(tracker, current_frame)
+                bbox, confidence = track_frame(tracker, current_frame)
 
-                if bbox is not None: 
+                if bbox is not None:
                     x, y, w, h = bbox
                     tracked_bboxes[frame_idx] = [x, y, w, h]
 
-                    cv2.rectangle(
-                        current_frame,
-                        (x, y),
-                        (x + w, y + h),
-                        (255, 0, 0),
-                        2
-                    )
+                    # Only draw bounding box if confidence is above threshold
+                    if confidence >= confidence_threshold:
+                        cv2.rectangle(
+                            current_frame,
+                            (x, y),
+                            (x + w, y + h),
+                            (255, 0, 0),
+                            2
+                        )
+                        # Optionally show confidence score
+                        cv2.putText(
+                            current_frame,
+                            f"Conf: {confidence:.2f}",
+                            (x, y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 0, 0),
+                            1
+                        )
+                    else:
+                        # Object is occluded, don't display bbox
+                        pass
                 else:
                     print(f"[INFO] Tracking lost at frame {frame_idx}")
                     tracking_active = False
