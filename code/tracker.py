@@ -218,13 +218,6 @@ def calculate_fps():
 if __name__ == "__main__":  
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--video_path",
-        "-v",
-        default="../Dataset/Lapchole/Lapchole1.mp4",
-        type=str,
-        help="Path to video file"
-    )
-    parser.add_argument(
         "--model",
         "-m",
         default="vitb_256_mae_ce_32x4_ep300",
@@ -233,6 +226,23 @@ if __name__ == "__main__":
         help="OSTrack model config"
     )
     args = parser.parse_args()
+
+    data_path = "../Dataset"
+    video_paths = []
+
+    for x in os.listdir(data_path):
+        if x == ".DS_Store":
+            continue
+
+        for y in os.listdir(os.path.join(data_path, x)):
+            if y == ".DS_Store":
+                continue
+
+            video_paths.append(os.path.join(data_path, x, y))
+            print(f"{len(video_paths)}. {video_paths[-1]}")
+    
+    video_index = int(input("\nEnter the video number: ").strip())
+    video_path = video_paths[video_index - 1]
 
     # Initialize OSTrack
     print("\n" + "="*60)
@@ -247,9 +257,9 @@ if __name__ == "__main__":
     
     print("="*60 + "\n")
 
-    cap = cv2.VideoCapture(args.video_path)
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise IOError(f"Cannot open video:   {args.video_path}")
+        raise IOError(f"Cannot open video:   {video_path}")
 
     # Get video properties
     video_fps = cap.get(cv2.CAP_PROP_FPS)
